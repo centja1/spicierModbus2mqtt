@@ -38,6 +38,7 @@ import random
 import ssl
 import math
 import struct
+import json
 
 import addToHomeAssistant
 
@@ -66,10 +67,11 @@ parser.add_argument('--tcp-port', default='502', type=int, help='Port for MODBUS
 parser.add_argument('--set-modbus-timeout',default='1',type=float, help='Response time-out for MODBUS devices')
 parser.add_argument('--config', required=True, help='Configuration file. Required!')
 parser.add_argument('--verbosity', default='3', type=int, help='Verbose level, 0=silent, 1=errors only, 2=connections, 3=mb writes, 4=all')
-parser.add_argument('--autoremove',action='store_true',help='Automatically remove poller if modbus communication has failed three times. Removed pollers can be reactivated by sending "True" or "1" to topic modbus/reset-autoremove')
+parser.add_argument('--autoremove',action='store_true',help='Automatically remove poller if modbus communication has failed three times.')
 parser.add_argument('--add-to-homeassistant',action='store_true',help='Add devices to Home Assistant using Home Assistant\'s MQTT-Discovery')
 parser.add_argument('--set-loop-break',default='0.01',type=float, help='Set pause in main polling loop. Defaults to 10ms.')
-
+parser.add_argument('--mqtt-client-id',default='modbus2mqtt',help='Default string to use as base client id in MQTT client')
+parser.add_argument('--msg-format', default="plain",help="Format of the MQTT message (plain, json)")
 
 args=parser.parse_args()
 verbosity=args.verbosity
@@ -102,7 +104,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 deviceList=[]
 referenceList=[]
-
+subscribedTopics=[]
 
 class Device:
     def __init__(self,name,slaveid):
@@ -117,6 +119,10 @@ class Device:
 class Poller:
     def __init__(self,topic,rate,slaveid,functioncode,reference,size,dataType):
         self.topic=topic
+
+        if len(str(self.topic)) > 0 and not self.topic.endswith("/"):
+            self.topic += "/"
+        
         self.rate=float(rate)
         self.slaveid=int(slaveid)
         self.functioncode=int(functioncode)
@@ -130,6 +136,10 @@ class Poller:
         self.disabled=False
         self.failcounter=0
         self.connected=False
+        self.speed=float(0)
+        self.ts_init=float(time.time())
+        self.pollCount=float(0)
+        self.mqtt_client = None
 
         for myDev in deviceList:
             if myDev.name == self.topic:
@@ -139,16 +149,16 @@ class Poller:
             device = Device(self.topic,slaveid)
             deviceList.append(device)
             self.device=device
+
         if verbosity>=2:
             print("Added new poller "+str(self.topic)+","+str(self.functioncode)+","+str(self.dataType)+","+str(self.reference)+","+str(self.size)+",")
-
 
     def failCount(self,failed):
         if not failed:
             self.failcounter=0
             if not self.connected:
                 self.connected = True
-                mqc.publish(globaltopic + self.topic +"/connected", "True", qos=1, retain=True)
+                self.mqtt_client.publish(globaltopic + self.topic +"connected", "True", qos=1, retain=True)
         else:
             if self.failcounter==3:
                 if args.autoremove:
@@ -156,7 +166,7 @@ class Poller:
                     print("Poller "+self.topic+" with Slave-ID "+str(self.slaveid)+ " and functioncode "+str(self.functioncode)+" disabled due to the above error.")
                 self.failcounter=4
                 self.connected = False
-                mqc.publish(globaltopic + self.topic +"/connected", "False", qos=1, retain=True)
+                self.mqtt_client.publish(globaltopic + self.topic +"connected", "False", qos=1, retain=True)
                 
             else:
                 if self.failcounter<3:
@@ -195,11 +205,11 @@ class Poller:
                             failed = True
                     if not failed:
                         if verbosity>=4:
-                            print("Read MODBUS, FC:"+str(self.functioncode)+", DataType:"+str(self.dataType)+", ref:"+str(self.reference)+", Qty:"+str(self.size)+", SI:"+str(self.slaveid))
+                            print("Read MODBUS, FC:"+str(self.functioncode)+", DataType:"+str(self.dataType)+", ref:"+str(self.reference)+", Qty:"+str(self.size)+", SI:"+str(self.slaveid)+", V:"+str(round(self.speed,2)))
                             print("Read MODBUS, DATA:"+str(data))
                         for ref in self.readableReferences:
                             val = data[ref.relativeReference:(ref.length+ref.relativeReference)]
-                            ref.checkPublish(val)
+                            ref.checkPublish(val,self.mqtt_client)
                     else:
                         if verbosity>=1:
                             print("Slave device "+str(self.slaveid)+" responded with error code: "+str(result.function_code))
@@ -208,6 +218,9 @@ class Poller:
                     if verbosity>=1:
                         print("Error talking to slave device:"+str(self.slaveid)+", trying again...")
                 self.failCount(failed)
+                self.pollCount += 1
+                if self.ts_init > 0:
+                    self.speed = self.pollCount / (time.time() - self.ts_init)
             else:
                 if master.connect():
                     if verbosity >= 1:
@@ -484,7 +497,7 @@ class Reference:
             self.relativeReference=self.reference-reference
             return True
 
-    def checkPublish(self,val):
+    def checkPublish(self,val,mqc):
         # Only publish messages after the initial connection has been made. If it became disconnected then the offline buffer will store messages,
         # but only after the intial connection was made.
         if mqc.initial_connection_made == True:
@@ -494,9 +507,17 @@ class Reference:
                 if self.scale:
                     val = val * self.scale
                 try:
-                    publish_result = mqc.publish(globaltopic+self.device.name+"/state/"+self.topic,val,retain=True)
+                    message = val
+                    if args.msg_format == "json":
+                        message = json.dumps({"value": val, "timestamp": time.time()})   
+
+                    if globaltopic+self.device.name+"set/+" not in subscribedTopics:
+                        mqc.subscribe(globaltopic+self.device.name+"set/+")   
+                        subscribedTopics.append(globaltopic+self.device.name+"set/+")  
+
+                    publish_result = mqc.publish(globaltopic+self.device.name+"state/"+self.topic,str(message),qos=2,retain=True)
                     if verbosity>=4:
-                        print("published MQTT topic: " + str(self.device.name+"/state/"+self.topic)+" value: " + str(self.lastval)+" RC:"+str(publish_result.rc))
+                        print("published MQTT topic: " + str(globaltopic+self.device.name+"state/"+self.topic)+" value: " + str(self.lastval)+" RC:"+str(publish_result.rc))
                 except:
                     if verbosity>=1:
                         print("Error publishing MQTT topic: " + str(self.device.name+"/state/"+self.topic)+"value: " + str(self.lastval))
@@ -565,34 +586,33 @@ with open(args.config,"r") as csvfile:
                 print("No poller for reference "+row["topic"]+".")
 
 def messagehandler(mqc,userdata,msg):
-    if str(msg.topic) == globaltopic+"reset-autoremove":
-        if not args.autoremove and verbosity>=1:
-            print("ERROR: Received autoremove-reset command but autoremove is not enabled. Check flags.")
-        if args.autoremove:
-            payload = str(msg.payload.decode("utf-8"))
-            if payload == "True" or payload == "1":
-                if verbosity>=3:
-                    print("Reactivating previously disabled pollers (command from MQTT)")
-                for p in pollers:
-                    if p.disabled == True:
-                        p.disabled = False
-                        p.failcounter = 0
-                        if verbosity>=3:
-                            print("Reactivated poller "+p.topic+" with Slave-ID "+str(p.slaveid)+ " and functioncode "+str(p.functioncode)+".")
-
+    topicSegments = msg.topic.split("/")
+    # if we don't have at least 4 segments (globaltopic, device, function, reference), then return
+    if len(topicSegments) < 4:
+        print("Received invalid message topic: " + msg.topic)
         return
-    (prefix,device,function,reference) = msg.topic.split("/")
+
+    # build the topic tree that will allow us to match a reference
+    # starting with the second element, append each element until we
+    # find a "set" element.  This will be the device topic
+    referenceName = topicSegments[len(topicSegments) - 1]
+    function = topicSegments[len(topicSegments) - 2]
+    deviceName = ""
+
+    for inx in range(1,len(topicSegments) - 2):
+        deviceName += (topicSegments[inx] + "/")
+
     if function != 'set':
         return
     myRef = None
     myDevice = None
     for iterDevice in deviceList:
-        if iterDevice.name == device:
+        if iterDevice.name == deviceName:
             myDevice = iterDevice
     if myDevice == None: # no such device
         return
     for iterRef in myDevice.writableReferences:
-        if iterRef.topic == reference:
+        if iterRef.topic == referenceName:
             myRef=iterRef
     if myRef == None: # no such reference
         return    
@@ -603,7 +623,7 @@ def messagehandler(mqc,userdata,msg):
                 result = master.write_coil(int(myRef.reference),value,unit=int(myRef.device.slaveid))
                 try:
                     if result.function_code < 0x80:
-                        myRef.checkPublish(value) # writing was successful => we can assume, that the corresponding state can be set and published
+                        #myRef.checkPublish(value) # writing was successful => we can assume, that the corresponding state can be set and published
                         if verbosity>=3:
                             print("Writing to device "+str(myDevice.name)+", Slave-ID="+str(myDevice.slaveid)+" at Reference="+str(myRef.reference)+" using function code "+str(myRef.writefunctioncode)+" successful.")
                     else:
@@ -621,10 +641,10 @@ def messagehandler(mqc,userdata,msg):
     if myRef.writefunctioncode == 6:
         value = myRef.dtype.parse(str(payload))
         if value is not None:
-            result = master.write_registers(int(myRef.reference),value,unit=myRef.device.slaveid)
+            result = master.write_register(int(myRef.reference),value,unit=myRef.device.slaveid)
             try:
                 if result.function_code < 0x80:
-                    myRef.checkPublish(value) # writing was successful => we can assume, that the corresponding state can be set and published
+                    #myRef.checkPublish(value) # writing was successful => we can assume, that the corresponding state can be set and published
                     if verbosity>=3:
                         print("Writing to device "+str(myDevice.name)+", Slave-ID="+str(myDevice.slaveid)+" at Reference="+str(myRef.reference)+" using function code "+str(myRef.writefunctioncode)+" successful.")
                 else:
@@ -642,11 +662,10 @@ def connecthandler(mqc,userdata,flags,rc):
         mqc.initial_connection_made = True
         if verbosity>=2:
             print("MQTT Broker connected succesfully: " + args.mqtt_host + ":" + str(mqtt_port))
-        mqc.subscribe(globaltopic + "+/set/+")
-        mqc.subscribe(globaltopic + "reset-autoremove")
+        #mqc.subscribe(mqc._client_id.decode("utf-8") + "+/set/+")
         if verbosity>=2:
             print("Subscribed to MQTT topic: "+globaltopic + "+/set/+")
-        mqc.publish(globaltopic + "connected", "True", qos=1, retain=True)
+        #mqc.publish(globaltopic + "connected", "True", qos=1, retain=True)
     elif rc == 1:
         if verbosity>=1:
             print("MQTT Connection refused – incorrect protocol version")
@@ -680,7 +699,7 @@ if args.rtu:
     if args.rtu_parity == "even":
             parity = "E"
 
-    master = SerialModbusClient(method="rtu", port=args.rtu, stopbits = 1, bytesize = 8, parity = parity, baudrate = int(args.rtu_baud), timeout=args.set_modbus_timeout)
+    master = SerialModbusClient(method="rtu", port=args.rtu, stopbits = 2, bytesize = 8, parity = parity, baudrate = int(args.rtu_baud), timeout=args.set_modbus_timeout)
 
 elif args.tcp:
     master = TCPModbusClient(args.tcp, args.tcp_port,client_id="modbus2mqtt", clean_session=False)
@@ -688,52 +707,107 @@ else:
     print("You must specify a modbus access method, either --rtu or --tcp")
     sys.exit(1)
 
-#Setup MQTT Broker
+#Setup a separate MQTT client for each poller
+for p in pollers:
 
-mqtt_port = args.mqtt_port
+    mqtt_port = args.mqtt_port
 
-if mqtt_port is None:
+    if mqtt_port is None:
+        if args.mqtt_use_tls:
+            mqtt_port = 8883
+        else:
+            mqtt_port = 1883
+
+    clientid=args.mqtt_client_id + "-" + str(time.time())
+    p.mqtt_client = mqtt.Client(client_id=clientid)
+    p.mqtt_client.on_connect=connecthandler
+    p.mqtt_client.on_message=messagehandler
+    p.mqtt_client.on_disconnect=disconnecthandler
+    p.mqtt_client.on_log= loghandler
+    p.mqtt_client.will_set(globaltopic + p.topic+"connected","False",qos=2,retain=True)
+    p.mqtt_client.initial_connection_attempted = False
+    p.mqtt_client.initial_connection_made = False
+    p.mqtt_client.set_topic_subscribed = False
+    if args.mqtt_user or args.mqtt_pass:
+        p.mqtt_client.username_pw_set(args.mqtt_user, args.mqtt_pass)
+
     if args.mqtt_use_tls:
-        mqtt_port = 8883
-    else:
-        mqtt_port = 1883
-
-clientid=globaltopic + "-" + str(time.time())
-mqc=mqtt.Client(client_id=clientid)
-mqc.on_connect=connecthandler
-mqc.on_message=messagehandler
-mqc.on_disconnect=disconnecthandler
-mqc.on_log= loghandler
-mqc.will_set(globaltopic+"connected","False",qos=2,retain=True)
-mqc.initial_connection_attempted = False
-mqc.initial_connection_made = False
-if args.mqtt_user or args.mqtt_pass:
-    mqc.username_pw_set(args.mqtt_user, args.mqtt_pass)
-
-if args.mqtt_use_tls:
-    if args.mqtt_tls_version == "tlsv1.2":
-        tls_version = ssl.PROTOCOL_TLSv1_2
-    elif args.mqtt_tls_version == "tlsv1.1":
-        tls_version = ssl.PROTOCOL_TLSv1_1
-    elif args.mqtt_tls_version == "tlsv1":
-        tls_version = ssl.PROTOCOL_TLSv1
-    elif args.mqtt_tls_version is None:
-        tls_version = None
-    else:
-        if verbosity >= 2:
-            print("Unknown TLS version - ignoring")
-        tls_version = None
+        if args.mqtt_tls_version == "tlsv1.2":
+            tls_version = ssl.PROTOCOL_TLSv1_2
+        elif args.mqtt_tls_version == "tlsv1.1":
+            tls_version = ssl.PROTOCOL_TLSv1_1
+        elif args.mqtt_tls_version == "tlsv1":
+            tls_version = ssl.PROTOCOL_TLSv1
+        elif args.mqtt_tls_version is None:
+            tls_version = None
+        else:
+            if verbosity >= 2:
+                print("Unknown TLS version - ignoring")
+            tls_version = None
 
 
-    if args.mqtt_insecure:
-        cert_regs = ssl.CERT_NONE
-    else:
-        cert_regs = ssl.CERT_REQUIRED
+        if args.mqtt_insecure:
+            cert_regs = ssl.CERT_NONE
+        else:
+            cert_regs = ssl.CERT_REQUIRED
 
-    mqc.tls_set(ca_certs=args.mqtt_cacerts, certfile= None, keyfile=None, cert_reqs=cert_regs, tls_version=tls_version)
+        p.mqtt_client.tls_set(ca_certs=args.mqtt_cacerts, certfile= None, keyfile=None, cert_reqs=cert_regs, tls_version=tls_version)
 
-    if args.mqtt_insecure:
-        mqc.tls_insecure_set(True)
+        if args.mqtt_insecure:
+            p.mqtt_client.tls_insecure_set(True)
+
+    # attempt initial connection
+    if not p.mqtt_client.initial_connection_attempted:
+       try:
+            print("Connecting to MQTT Broker: " + args.mqtt_host + ":" + str(mqtt_port) + "...")
+            p.mqtt_client.connect(args.mqtt_host, mqtt_port, 60)
+            p.mqtt_client.initial_connection_attempted = True #Once we have connected the mqc loop will take care of reconnections.
+            p.mqtt_client.loop_start()
+            #Setup HomeAssistant
+            if(addToHass):
+                adder=addToHomeAssistant.HassConnector(p.mqtt_client,globaltopic,verbosity>=1)
+                adder.addAll(referenceList)
+            if verbosity >= 1:
+                print("MQTT Loop started")
+       except:
+            if verbosity>=1:
+              print("Socket Error connecting to MQTT broker: " + args.mqtt_host + ":" + str(mqtt_port) + ", check LAN/Internet connection, trying again...")
+
+    #mqc=mqtt.Client(client_id=clientid)
+    # mqc.on_connect=connecthandler
+    # mqc.on_message=messagehandler
+    # mqc.on_disconnect=disconnecthandler
+    # mqc.on_log= loghandler
+    # mqc.will_set(globaltopic+"connected","False",qos=2,retain=True)
+    # mqc.initial_connection_attempted = False
+    # mqc.initial_connection_made = False
+    # if args.mqtt_user or args.mqtt_pass:
+    #     mqc.username_pw_set(args.mqtt_user, args.mqtt_pass)
+
+    # if args.mqtt_use_tls:
+    #     if args.mqtt_tls_version == "tlsv1.2":
+    #         tls_version = ssl.PROTOCOL_TLSv1_2
+    #     elif args.mqtt_tls_version == "tlsv1.1":
+    #         tls_version = ssl.PROTOCOL_TLSv1_1
+    #     elif args.mqtt_tls_version == "tlsv1":
+    #         tls_version = ssl.PROTOCOL_TLSv1
+    #     elif args.mqtt_tls_version is None:
+    #         tls_version = None
+    #     else:
+    #         if verbosity >= 2:
+    #             print("Unknown TLS version - ignoring")
+    #         tls_version = None
+
+
+    #     if args.mqtt_insecure:
+    #         cert_regs = ssl.CERT_NONE
+    #     else:
+    #         cert_regs = ssl.CERT_REQUIRED
+
+    #     mqc.tls_set(ca_certs=args.mqtt_cacerts, certfile= None, keyfile=None, cert_reqs=cert_regs, tls_version=tls_version)
+
+    #     if args.mqtt_insecure:
+    #         mqc.tls_insecure_set(True)
 
 
 if len(pollers)<1:
@@ -758,30 +832,39 @@ while control.runLoop:
             if verbosity >= 1:
                 print("MODBUS connection error, trying again...")
 
-    if not mqc.initial_connection_attempted:
-       try:
-            print("Connecting to MQTT Broker: " + args.mqtt_host + ":" + str(mqtt_port) + "...")
-            mqc.connect(args.mqtt_host, mqtt_port, 60)
-            mqc.initial_connection_attempted = True #Once we have connected the mqc loop will take care of reconnections.
-            mqc.loop_start()
-            #Setup HomeAssistant
-            if(addToHass):
-                adder=addToHomeAssistant.HassConnector(mqc,globaltopic,verbosity>=1)
-                adder.addAll(referenceList)
-            if verbosity >= 1:
-                print("MQTT Loop started")
-       except:
-            if verbosity>=1:
-              print("Socket Error connecting to MQTT broker: " + args.mqtt_host + ":" + str(mqtt_port) + ", check LAN/Internet connection, trying again...")
+    # if not mqc.initial_connection_attempted:
+    #    try:
+    #         print("Connecting to MQTT Broker: " + args.mqtt_host + ":" + str(mqtt_port) + "...")
+    #         mqc.connect(args.mqtt_host, mqtt_port, 60)
+    #         mqc.initial_connection_attempted = True #Once we have connected the mqc loop will take care of reconnections.
+    #         mqc.loop_start()
+    #         #Setup HomeAssistant
+    #         if(addToHass):
+    #             adder=addToHomeAssistant.HassConnector(mqc,globaltopic,verbosity>=1)
+    #             adder.addAll(referenceList)
+    #         if verbosity >= 1:
+    #             print("MQTT Loop started")
+    #    except:
+    #         if verbosity>=1:
+    #           print("Socket Error connecting to MQTT broker: " + args.mqtt_host + ":" + str(mqtt_port) + ", check LAN/Internet connection, trying again...")
 
-    if mqc.initial_connection_made: #Don't start polling unless the initial connection to MQTT has been made, no offline MQTT storage will be available until then.
-        if modbus_connected:
-            try:
-                for p in pollers:
+    if modbus_connected:
+        for p in pollers:
+            if p.mqtt_client.initial_connection_made:
+                try:
                     p.checkPoll()
-            except:
-                if verbosity>=1:
-                    print("Exception Error when polling or publishing, trying again...")
+                except:
+                    if verbosity>=1:
+                        print("Exception Error when polling or publishing, trying again...")
+
+    # if mqc.initial_connection_made: #Don't start polling unless the initial connection to MQTT has been made, no offline MQTT storage will be available until then.
+    #     if modbus_connected:
+    #         try:
+    #             for p in pollers:
+    #                 p.checkPoll()
+    #         except:
+    #             if verbosity>=1:
+    #                 print("Exception Error when polling or publishing, trying again...")
 
     time.sleep(args.set_loop_break)
 
