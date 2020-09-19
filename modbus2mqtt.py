@@ -515,7 +515,7 @@ class Reference:
                         mqc.subscribe(globaltopic+self.device.name+"set/+")   
                         subscribedTopics.append(globaltopic+self.device.name+"set/+")  
 
-                    publish_result = mqc.publish(globaltopic+self.device.name+"state/"+self.topic,str(message),qos=2,retain=True)
+                    publish_result = mqc.publish(globaltopic+self.device.name+"state/"+self.topic,str(message),qos=1,retain=False)
                     if verbosity>=4:
                         print("published MQTT topic: " + str(globaltopic+self.device.name+"state/"+self.topic)+" value: " + str(self.lastval)+" RC:"+str(publish_result.rc))
                 except:
