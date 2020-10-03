@@ -470,7 +470,6 @@ class Reference:
         self.topic=topic
         self.reference=int(reference)
         self.lastval=None
-        self.lastPublish=0
         self.scale=None
         if scaling:
             try:
@@ -503,7 +502,7 @@ class Reference:
         # but only after the intial connection was made.
         if mqc.initial_connection_made == True:
             val = self.dtype.combine(val)
-            if self.lastval != val or time.time() - self.lastPublish > 5:
+            if self.lastval != val:
                 self.lastval = val
                 if self.scale:
                     val = val * self.scale
@@ -516,8 +515,7 @@ class Reference:
                         mqc.subscribe(globaltopic+self.device.name+"set/+")   
                         subscribedTopics.append(globaltopic+self.device.name+"set/+")  
 
-                    publish_result = mqc.publish(globaltopic+self.device.name+"state/"+self.topic,str(message),qos=1,retain=False)
-                    self.lastPublish = time.time()
+                    publish_result = mqc.publish(globaltopic+self.device.name+"state/"+self.topic,str(message),qos=2,retain=True)
                     if verbosity>=4:
                         print("published MQTT topic: " + str(globaltopic+self.device.name+"state/"+self.topic)+" value: " + str(self.lastval)+" RC:"+str(publish_result.rc))
                 except:
